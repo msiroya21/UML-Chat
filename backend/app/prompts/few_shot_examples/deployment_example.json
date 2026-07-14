@@ -1,0 +1,20 @@
+{
+  "prompt": "The compliance platform runs a web app and an ingestion worker on a cloud application server. The worker calls the external SEBI feed over the internet, and both the web app and worker read/write a managed PostgreSQL database.",
+  "ir": {
+    "diagram_type": "deployment",
+    "title": "Compliance Platform Deployment",
+    "nodes": [
+      { "id": "appserver", "name": "Cloud App Server", "type": "node" },
+      { "id": "db",        "name": "PostgreSQL",       "type": "database" },
+      { "id": "sebi",      "name": "SEBI Feed",         "type": "cloud" }
+    ],
+    "artifacts": [
+      { "id": "webapp", "name": "web-app.jar",      "deployed_on": "appserver" },
+      { "id": "worker", "name": "ingestion-worker.jar", "deployed_on": "appserver" }
+    ],
+    "connections": [
+      { "from": "appserver", "to": "db",   "label": "JDBC" },
+      { "from": "appserver", "to": "sebi", "label": "HTTPS" }
+    ]
+  }
+}

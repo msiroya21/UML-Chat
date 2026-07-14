@@ -1,6 +1,6 @@
 # UML Chatbot — Architecture & Interview Prep
 
-Natural language prompt → validated IR → PlantUML DSL → rendered SVG, streamed to the browser in real-time via WebSocket.
+Natural-language prompt → validated IR → PlantUML DSL → rendered SVG, streamed to the browser in real-time over WebSocket. Updates are incremental (diff + carry-forward), and the data layer is designed for a single, clean query path.
 
 ---
 
@@ -10,67 +10,59 @@ Natural language prompt → validated IR → PlantUML DSL → rendered SVG, stre
 2. [Component Map](#2-component-map)
 3. [Startup & API Spin-up](#3-startup--api-spin-up)
 4. [API Contracts](#4-api-contracts)
-   - [Auth](#41-auth)
-   - [Sessions](#42-sessions)
-   - [Messages](#43-messages)
-   - [Diagrams](#44-diagrams)
-   - [Feedback](#45-feedback)
-   - [WebSocket Protocol](#46-websocket-protocol)
 5. [Generation Pipeline](#5-generation-pipeline)
-6. [IR Abstraction Layer](#6-ir-abstraction-layer)
-7. [Caching Strategy](#7-caching-strategy)
-8. [Feedback & ART Loop](#8-feedback--art-loop)
-9. [Probable Interview Questions](#9-probable-interview-questions)
+6. [Update Semantics (diff + carry-forward)](#6-update-semantics-diff--carry-forward)
+7. [IR Abstraction Layer](#7-ir-abstraction-layer)
+8. [Data Layer](#8-data-layer)
+9. [Memory & Conversation Context](#9-memory--conversation-context)
+10. [Caching Strategy](#10-caching-strategy)
+11. [Feedback & Training Data](#11-feedback--training-data)
+12. [Interview Q&A](#12-interview-qa)
 
 ---
 
 ## 1. System Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  BROWSER                                                    │
-│  React Frontend   ←─ WebSocket ─→   useWebSocket hook      │
-│  (ChatPanel, DiagramPanel)          api.js (REST + JWT)     │
-└────────────────────────┬────────────────────────────────────┘
-                         │ REST /api/v1  │ WS /ws/stream/{id}
-┌────────────────────────▼────────────────────────────────────┐
-│  FASTAPI BACKEND                                            │
-│  API Routers  →  BackgroundTasks  →  WS ConnectionManager  │
-│  SQLAlchemy/aiosqlite (SQLite)                              │
-└────────────────────────┬────────────────────────────────────┘
-                         │ asyncio.gather (parallel per diagram type)
-┌────────────────────────▼────────────────────────────────────┐
-│  ORCHESTRATION LAYER                                        │
-│  Planner → Validator → Repair Agent → Code Gen → Renderer  │
-└──────────┬──────────────────────────────────────┬──────────┘
-           │                                      │
-    ┌──────▼──────┐                     ┌─────────▼─────────┐
-    │  Groq API   │                     │ PlantUML Server   │
-    │ Llama-3.3   │                     │ (Docker :8090)    │
-    └─────────────┘                     └───────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│  BROWSER (React)                                               │
+│  ChatPanel · DiagramPanel · SessionSidebar                    │
+│  useWebSocket hook          api.js (REST + JWT)               │
+└───────────────┬───────────────────────────┬───────────────────┘
+                │ REST /api/v1               │ WS /ws/stream/{id}
+┌───────────────▼───────────────────────────▼───────────────────┐
+│  FASTAPI BACKEND                                              │
+│  routers → BackgroundTasks → WS ConnectionManager (buffered) │
+│  SQLAlchemy 2.0 async / aiosqlite (+ Alembic)                │
+└───────────────┬───────────────────────────────────────────────┘
+                │ asyncio.gather over an action plan, Semaphore(4)
+┌───────────────▼───────────────────────────────────────────────┐
+│  ORCHESTRATION                                                │
+│  update_planner → planner → validator → repair → codegen →    │
+│  renderer (syntax-error detection)                            │
+└──────────┬────────────────────────────────────────┬──────────┘
+           │                                        │
+    ┌──────▼──────┐                        ┌────────▼────────┐
+    │  Groq API   │ (llm_client:           │ PlantUML Server │
+    │  Llama-3.3  │  central fallback +     │ (Docker :8090)  │
+    └─────────────┘  error taxonomy)       └─────────────────┘
 ```
 
-### Three User Scenarios
+### Three user scenarios
 
 | Scenario | HTTP call | What happens |
 |---|---|---|
-| New user, new prompt | `POST /sessions/{id}/messages` | Full pipeline runs, results stream over WS |
-| Existing user, updated prompt | `PUT /sessions/{id}/messages/{id}` | Bundles old + new prompt, re-runs pipeline, version increments |
-| Existing user, feedback | `POST /feedback` | Stored in DB, forwarded to ART stub for RL training |
+| New user, new prompt | `POST /sessions/{id}/messages` | Auto-select types if none given; full pipeline per type; results stream over WS |
+| Existing user, updated prompt | `PUT /sessions/{id}/messages/{mid}` | **Diff + intent routing**: only new/targeted types (re)generate; unchanged diagrams carried forward |
+| Existing user, feedback | `POST /feedback` | Stored (anchored to a message) + a durable, attributable training sample |
 
-### Key Design Decisions
+### Key design decisions
 
-**Why WebSocket over polling?**
-Pipeline takes 10–30s and produces multiple independent outputs. WS lets us push each diagram as it finishes rather than waiting for all. Polling at 2s intervals would be wasteful and still feel laggy.
-
-**Why an IR layer instead of asking the LLM to output PlantUML directly?**
-LLMs frequently produce subtly invalid DSL — mismatched lifeline names, undefined participants in fragments. Validating and repairing raw PlantUML strings requires regex heuristics or JVM overhead. The IR layer gives us a schema-validated JSON structure we can validate with Pydantic, repair semantically, and convert deterministically to DSL. It decouples "understanding intent" (LLM's job) from "correct syntax" (deterministic code gen's job).
-
-**Why PlantUML server (Docker) over JAR?**
-JAR requires a JVM in the Python container. The Docker-compose sidecar keeps the backend pure Python and keeps the JVM isolated.
-
-**Why Groq?**
-~700 tok/s vs ~60 tok/s on comparable GPU-based inference. IR generation is ~1–2s instead of 10–15s. The latency difference is the primary reason.
+- **IR layer** for the 7 core types: the LLM outputs schema-validated JSON, not raw DSL, so validation/repair/training are clean and deterministic code-gen owns syntax.
+- **Snapshot + render-on-open storage:** persist `ir` + `plantuml_code` only. SVG is re-rendered from PlantUML on demand — no large derived blobs in the DB.
+- **Incremental updates:** an update never blindly re-runs everything; it computes a per-type action plan and carries unchanged diagrams forward. A failed regeneration keeps the prior good diagram.
+- **Central LLM client** (`llm_client.py`) with an error taxonomy: a bad API key fails loudly; transient 503s fall back across models; parse errors are handled — no silently-fabricated "example" diagrams.
+- **Real syntax verification:** the renderer detects PlantUML error images and feeds them into the repair loop.
 
 ---
 
@@ -81,689 +73,360 @@ JAR requires a JVM in the Python container. The Docker-compose sidecar keeps the
 | File | Responsibility |
 |---|---|
 | `main.py` | App factory; `@asynccontextmanager` lifespan (DB init); CORS; router mounts |
-| `api/auth.py` | `POST /register`, `POST /login`, returns JWT |
-| `api/sessions.py` | Session CRUD + message CRUD + `BackgroundTasks` orchestrator trigger |
-| `api/diagrams.py` | List diagrams, SVG/PNG export |
-| `api/feedback.py` | Persist rating, forward to ART stub |
+| `api/auth.py` | `POST /register`, `POST /login` → JWT |
+| `api/sessions.py` | Session CRUD, message create/update, lineage walk + prior-diagram snapshots for updates |
+| `api/diagrams.py` | List diagrams (SVG re-rendered on demand), SVG/PNG export |
+| `api/feedback.py` | Persist feedback, existence checks |
 | `api/ws.py` | WebSocket endpoint, keep-alive receive loop |
-| `services/orchestrator.py` | 7-step pipeline, `asyncio.gather`, WS broadcast |
-| `services/planner.py` | LLM call → structured IR JSON |
-| `services/validator.py` | Pydantic schema validation on IR |
-| `services/repair_agent.py` | Re-prompt LLM with errors, up to 3 retries |
-| `services/code_generator.py` | IR dict → PlantUML DSL string (deterministic) |
-| `services/renderer.py` | HTTP GET to PlantUML server → SVG string |
-| `services/cache.py` | SHA-256 keyed in-memory dict |
-| `core/ws_manager.py` | `ConnectionManager`: `message_id → List[WebSocket]` |
-| `core/config.py` | `pydantic-settings` Settings; reads `.env`; fail-fast on missing keys |
+| `services/orchestrator.py` | Action-plan pipeline, `asyncio.gather` + `Semaphore(4)`, WS broadcast, upserts, `run_update_background` |
+| `services/update_planner.py` | LLM intent classifier + `compute_update_actions` (generate/regenerate/carry_forward) |
+| `services/planner.py` | LLM → IR JSON (JSON mode) or direct PlantUML; `prior_ir` edit mode; raises typed errors (no example fallback) |
+| `services/llm_client.py` | `invoke_with_fallback` (model fallback), `extract_json`, `LLMConfigError` / `LLMUnavailableError` |
+| `services/validator.py` | Pydantic IR validation + structural PlantUML check |
+| `services/repair_agent.py` | Re-prompt LLM with errors (≤3 retries) |
+| `services/code_generator.py` | IR dict → PlantUML DSL (deterministic) for all 7 IR types |
+| `services/renderer.py` | PlantUML server → SVG; **detects error images**; shared httpx client |
+| `services/cache.py` | Bounded LRU (`ir` + `plantuml_code`); never caches fallbacks |
+| `services/prompt_processor.py` | `build_context` — full-history context from the message chain |
+| `services/title_generator.py` | Session auto-title (LLM + heuristic fallback) |
+| `services/feedback_service.py` | Store feedback + build/persist training samples |
+| `core/ws_manager.py` | `ConnectionManager`: `message_id → List[WebSocket]` + per-message frame buffer (replay on connect) |
+| `core/config.py` | `pydantic-settings`; `GROQ_API_KEY`, `LLM_MODEL`, `LLM_FALLBACK_MODELS`, … |
 | `core/security.py` | `hash_password`, `verify_password`, `create_jwt`, `decode_jwt` |
-| `core/dependencies.py` | `get_current_user` FastAPI dependency (injected into all protected routes) |
-| `models/db.py` | SQLAlchemy ORM: `User`, `Session`, `Message`, `Diagram`, `Feedback` |
+| `core/dependencies.py` | `get_current_user` FastAPI dependency |
+| `models/db.py` | ORM: `User`, `Session`, `Message`, `Diagram`, `Feedback`, `TrainingSample`; SQLite PRAGMAs |
+| `alembic/` | Migrations (initial schema) |
 
 ### Frontend — `frontend/src/`
 
 | File | Responsibility |
 |---|---|
-| `App.jsx` | Auth gate, 3-panel layout shell |
-| `components/ChatPanel.jsx` | Prompt input, diagram type chips (14 types), update/feedback mode toggle |
-| `components/DiagramPanel.jsx` | SVG cards, zoom/pan, PlantUML code toggle, fallback badge |
-| `components/FeedbackWidget.jsx` | 5-star rating, feedback type selector, comment |
+| `App.jsx` | Auth gate; drives the diagram panel via a `view` = live (WS) or history (REST re-hydration) |
+| `components/ChatPanel.jsx` | Prompt input, type chips + Select all/Clear, Update/Feedback mode, restores `lastMessageId` from history |
+| `components/DiagramPanel.jsx` | Live WS stream **or** re-hydrated history; SVG via `data:` URI `<img>`; fallback badge + error banner |
+| `components/FeedbackWidget.jsx` | Star rating, type selector, comment |
 | `components/SessionSidebar.jsx` | Session list, create, inline rename |
 | `hooks/useWebSocket.js` | WS connect, frame dispatch by type |
-| `services/api.js` | Fetch-based REST client with JWT header injection |
+| `services/api.js` | Fetch REST client with JWT injection |
 
 ### Infrastructure
 
 | File | Responsibility |
 |---|---|
 | `docker-compose.yml` | `plantuml/plantuml-server:jetty` on port 8090 |
-| `backend/.env` | `GROQ_API_KEY`, `JWT_SECRET`, `DATABASE_URL`, `PLANTUML_SERVER_URL` |
-| `backend/uml_chatbot.db` | SQLite file, auto-created on first startup via ORM |
+| `backend/.env` | `GROQ_API_KEY`, `JWT_SECRET`, `DATABASE_URL`, `PLANTUML_SERVER_URL`, `LLM_MODEL` |
+| `backend/uml_chatbot.db` | SQLite file (Alembic-managed; app also create_all on first run) |
 
 ---
 
 ## 3. Startup & API Spin-up
 
-> The startup sequence has a dependency order. Do not skip steps.
+> Dependency order matters — don't skip steps.
 
-### Step 1 — PlantUML sidecar (Docker)
+**Step 1 — PlantUML sidecar:** `docker compose up -d` → server on 8090. The backend doesn't hard-fail without it; render calls fail until it's up.
 
-```bash
-docker-compose up -d
-# Verify it's up:
-curl http://localhost:8090/
-```
+**Step 2 — Config (Pydantic Settings):** `core/config.py` reads `backend/.env` on import. Missing/blank `GROQ_API_KEY` doesn't crash boot — instead the central `llm_client` raises `LLMConfigError` at call time, surfaced to the user as a clear config error rather than a fake diagram.
 
-The backend doesn't hard-fail if this is absent at startup — it only fails at render time. But start it first.
+**Step 3 — Schema:** `alembic upgrade head` creates the schema. For convenience the FastAPI lifespan also runs `init_db()` (`Base.metadata.create_all`, idempotent) so a fresh dev run works without Alembic. SQLite connections get `PRAGMA foreign_keys=ON`, WAL, and `busy_timeout` via a connect-event listener (FK enforcement + parallel-write friendliness).
 
----
+**Step 4 — CORS + routers:** CORS middleware is registered before routers. Routers mount under `/api/v1` (auth, sessions, diagrams, feedback); the WS router mounts at root (`/ws/stream/{message_id}`).
 
-### Step 2 — Environment variables (Pydantic Settings)
+**Step 5 — Backend:** `uvicorn app.main:app --reload --port 8000` (Swagger at `/docs`).
 
-`core/config.py` extends `pydantic_settings.BaseSettings`. On import it reads `backend/.env` and validates all fields. Missing required keys throw a `ValidationError` **before Uvicorn binds a port** — fail-fast at load time, not at first request.
-
-Required keys in `backend/.env`:
-```
-GROQ_API_KEY=gsk_...
-JWT_SECRET=your-secret-key-here
-DATABASE_URL=sqlite+aiosqlite:///./uml_chatbot.db
-PLANTUML_SERVER_URL=http://localhost:8090
-LLM_MODEL=llama-3.3-70b-versatile
-```
-
----
-
-### Step 3 — FastAPI lifespan (DB init)
-
-`main.py` uses `@asynccontextmanager` for the lifespan (the modern replacement for the deprecated `@app.on_event("startup")`). On startup it calls `init_db()` which runs `Base.metadata.create_all(engine)` asynchronously via aiosqlite. All five ORM tables are created idempotently — no migrations needed for SQLite.
-
-```python
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await init_db()   # creates tables if not exist
-    yield
-    # engine cleanup on shutdown
-
-app = FastAPI(lifespan=lifespan)
-```
-
-If `init_db()` raises, the process exits before accepting requests. No route is ever callable before the DB is ready.
-
----
-
-### Step 4 — CORS and router registration
-
-CORS middleware is added **before** routers are included (FastAPI middleware ordering matters). The WebSocket router is mounted at root level, not under `/api/v1`, because browsers don't support custom headers on WS upgrade requests — auth is via query param `?token=`.
-
-```python
-app.add_middleware(CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"])
-
-app.include_router(auth_router,     prefix="/api/v1/auth")
-app.include_router(sessions_router, prefix="/api/v1/sessions")
-app.include_router(diagrams_router, prefix="/api/v1/diagrams")
-app.include_router(feedback_router, prefix="/api/v1/feedback")
-app.include_router(ws_router)       # /ws/stream/{message_id}
-```
-
----
-
-### Step 5 — Start the backend
-
-```bash
-cd backend
-uvicorn app.main:app --reload --port 8000
-```
-
-Swagger UI: `http://localhost:8000/docs`
-WebSocket test: `ws://localhost:8000/ws/stream/{message_id}?token={jwt}`
-
----
-
-### Step 6 — Start the frontend
-
-```bash
-cd frontend
-npm install
-npm run dev   # http://localhost:5173
-```
-
-The Vite dev server calls `http://localhost:8000` directly — no proxy config. API base URL is set in `services/api.js`.
+**Step 6 — Frontend:** `npm run dev` in `frontend/` (Vite on 5173; API base is hard-coded to `localhost:8000` in `services/api.js`).
 
 ---
 
 ## 4. API Contracts
 
-All endpoints under `/api/v1`. Protected routes require `Authorization: Bearer <jwt>`.
+All under `/api/v1`; protected routes require `Authorization: Bearer <jwt>`.
 
 ### 4.1 Auth
 
-#### `POST /api/v1/auth/register` — public
-
-```json
+```jsonc
+// POST /api/v1/auth/register        // public
 // Request
-{
-  "username": "manan",
-  "email": "m@example.com",
-  "password": "s3cur3pass"
-}
-
+{ "email": "m@example.com", "password": "s3cur3pass", "name": "Manan" }
 // Response 201
-{
-  "user_id": "uuid-...",
-  "username": "manan",
-  "email": "m@example.com",
-  "created_at": "2026-07-12T10:00:00Z"
-}
+{ "user_id": "uuid-...", "token": "eyJhbGci..." }
 ```
 
-Errors: `409` email already registered, `422` Pydantic validation failure.
-
----
-
-#### `POST /api/v1/auth/login` — public
-
-```json
-// Request
-{
-  "email": "m@example.com",
-  "password": "s3cur3pass"
-}
-
-// Response 200
-{
-  "token": "eyJhbGci...",   // HS256 JWT
-  "expires_in": 86400,      // seconds
-  "user": {
-    "user_id": "uuid-...",
-    "username": "manan",
-    "email": "m@example.com"
-  }
-}
+```jsonc
+// POST /api/v1/auth/login           // public
+// Request  { "email": "m@example.com", "password": "s3cur3pass" }
+// Response 200  { "user_id": "uuid-...", "token": "eyJhbGci..." }
 ```
 
-JWT payload contains `sub` (user_id) and `exp`. Decoded by `get_current_user` dependency injected into every protected route via FastAPI's `Depends()`.
-
----
+JWT payload: `sub` (user_id) + `exp`. Decoded by the `get_current_user` dependency.
 
 ### 4.2 Sessions
 
-#### `POST /api/v1/sessions` — protected
+```jsonc
+// POST /api/v1/sessions             { "title": "..." }  // title optional -> "New Session", auto-titled on first prompt
+// -> 201 { "session_id", "created_at", "title" }
 
-```json
-// Request
-{ "title": "Compliance Monitor" }  // optional; LLM auto-generates if omitted
+// GET  /api/v1/sessions?page=1&per_page=50
+// -> { "sessions": [ { "session_id", "created_at", "title" } ] }
 
-// Response 201
-{
-  "session_id": "uuid-...",
-  "title": "Compliance Monitor",
-  "user_id": "uuid-...",
-  "created_at": "2026-07-12T10:00:00Z",
-  "updated_at": "2026-07-12T10:00:00Z"
-}
+// PATCH /api/v1/sessions/{id}       { "title": "New Title" }  -> 200 SessionResponse
 ```
-
-#### `GET /api/v1/sessions` — protected
-
-Query params: `?page=1&limit=20`
-
-```json
-{
-  "sessions": [ /* SessionResponse[] */ ],
-  "total": 12,
-  "page": 1,
-  "pages": 1
-}
-```
-
-#### `PATCH /api/v1/sessions/{session_id}` — protected
-
-```json
-// Request
-{ "title": "New Title" }
-// Response 200: updated SessionResponse
-```
-
----
 
 ### 4.3 Messages
 
-#### `GET /api/v1/sessions/{session_id}/messages` — protected
-
-```json
-{
-  "messages": [{
-    "message_id": "uuid-...",
-    "session_id": "uuid-...",
-    "prompt": "I am working on a compliance...",
-    "diagram_types": ["sequence", "component"],
-    "version": 1,
-    "status": "complete",     // pending | generating | complete | error
-    "parent_msg_id": null,
-    "created_at": "2026-07-12T10:00:00Z"
-  }]
-}
+```jsonc
+// GET /api/v1/sessions/{id}/messages
+// -> { "messages": [ { "message_id", "prompt", "diagram_types", "version", "status", "created_at" } ] }
+//    status: processing | complete | failed
 ```
 
----
-
-#### `POST /api/v1/sessions/{session_id}/messages` — protected — **triggers WS**
-
-> **Scenario 1: New user / new generation**
-
-```json
-// Request
-{
-  "prompt": "I am working on a compliance monitoring solution...",
-  "diagram_types": ["sequence", "component", "class"]
-  // diagram_types is optional — LLM auto-selects if omitted
-}
-
-// Response 202 — Accepted (generation runs in background)
-{
-  "message_id": "uuid-...",
-  "session_id": "uuid-...",
-  "version": 1,
-  "status": "pending",
-  "diagram_types": ["sequence", "component", "class"]
-}
+```jsonc
+// POST /api/v1/sessions/{id}/messages         // Scenario 1 — triggers WS
+// Request  { "prompt": "...", "diagram_types": ["sequence","class"] }   // diagram_types optional
+// Response 202  { "message_id", "status": "processing", "ws_url": "/ws/stream/{message_id}" }
 ```
 
-**Key:** Response returns immediately with `status: "pending"`. Client opens a WebSocket to `/ws/stream/{message_id}` to receive progress. HTTP 202 (not 200) because the work is accepted but not yet complete.
-
----
-
-#### `PUT /api/v1/sessions/{session_id}/messages/{message_id}` — protected — **triggers WS**
-
-> **Scenario 2: Existing user, updated prompt**
-
-```json
-// Request
-{
-  "prompt": "Now also add gap analysis against ISO 27001",
-  "diagram_types": ["sequence", "class"]
-}
-
-// Response 202
-// Same shape as POST, with version: 2, parent_msg_id: "{original_id}"
+```jsonc
+// PUT /api/v1/sessions/{id}/messages/{mid}     // Scenario 2 — triggers WS
+// Request  { "prompt": "also add a component diagram", "diagram_types": ["sequence","class","component"] }
+// Response 202  { "message_id", "version": 2, "status": "processing", "ws_url": "/ws/stream/{message_id}" }
 ```
 
-**What happens internally:** The handler fetches the original message, calls `process_prompt(new_prompt, old_prompt)` which produces a bundled prompt:
-
-```
-{old_prompt}
-
----
-
-Updated requirements:
-{new_prompt}
-```
-
-A new `Message` row is created with `version = old.version + 1` and `parent_msg_id` pointing to the original. Full pipeline re-runs on the bundled prompt. Original message and its diagrams are never modified — DB is append-only.
-
----
+On update the handler creates a new `Message` (`version+1`, `parent_msg_id` → previous), walks the `parent_msg_id` lineage to build full-history context, snapshots the previous turn's diagrams, and dispatches `run_update_background` (which classifies + builds the action plan). See §6.
 
 ### 4.4 Diagrams
 
-#### `GET /api/v1/diagrams?message_id={id}` — protected
+```jsonc
+// GET /api/v1/sessions/{id}/messages/{mid}/diagrams
+// -> [ { "diagram_id", "diagram_type", "plantuml_code", "svg", "ir",
+//        "is_valid", "is_fallback", "version" } ]
+//    svg is RE-RENDERED from plantuml_code at request time (not stored).
 
-```json
-{
-  "diagrams": [{
-    "diagram_id": "uuid-...",
-    "message_id": "uuid-...",
-    "diagram_type": "sequence",
-    "plantuml_code": "@startuml\n...\n@enduml",
-    "svg": "<svg ...></svg>",
-    "status": "complete",   // complete | error | fallback
-    "error_msg": null,
-    "created_at": "2026-07-12T10:00:00Z"
-  }]
-}
+// GET /api/v1/sessions/{id}/messages/{mid}/diagrams/{diagram_id}?format=svg|png
+// -> raw file bytes (rendered from stored plantuml_code)
 ```
-
-#### `GET /api/v1/diagrams/{diagram_id}/export?format=svg` — protected
-
-Query param: `?format=svg` (default) or `?format=png`. Returns raw file bytes with appropriate `Content-Type`. PNG re-fetches from the PlantUML server using the stored `plantuml_code` at request time.
-
----
 
 ### 4.5 Feedback
 
-#### `POST /api/v1/feedback` — protected
-
-> **Scenario 3: Existing user, feedback**
-
-```json
-// Request
-{
-  "message_id": "uuid-...",
-  "diagram_id": "uuid-...",      // optional — session-level feedback if omitted
-  "rating": 4,                   // 1–5
-  "feedback_type": "wrong_layout",
-  "comment": "Missing the SEBI API box"
-}
-
-// Response 201
-{ "feedback_id": "uuid-...", "status": "stored" }
+```jsonc
+// POST /api/v1/feedback              // Scenario 3
+// Request (at least one of diagram_id / message_id required)
+{ "diagram_id": "uuid-...", "rating": 5, "feedback_type": "praise", "feedback_text": "great" }
+// Response 201  { "feedback_id": "uuid-...", "status": "accepted" }
 ```
 
-Stored in `Feedback` table. `feedback_service.py` then calls `_log_art_sample_diagram()` which formats a DPO training sample and logs it. In production this would push to the LangChain ART training queue.
+The stored row **always** has `message_id` (derived from `diagram_id` when only that is given) → single join path. See §8 and §11.
 
----
+### 4.6 WebSocket protocol
 
-### 4.6 WebSocket Protocol
+Connect to `ws://localhost:8000/ws/stream/{message_id}` right after the 202. Frames broadcast before the socket connects are **buffered and replayed on connect** (no lost early frames).
 
-Connect immediately after receiving `message_id` from POST/PUT. Auth via query param (browser WS API doesn't support custom headers on upgrade).
+> **Auth note:** the WS endpoint is currently **unauthenticated** (a deferred security item). Intended design is a `?token={jwt}` query param (browsers can't set headers on WS upgrade) verified with the same `decode_jwt`.
 
-```
-ws://localhost:8000/ws/stream/{message_id}?token={jwt}
-```
+Server → client frames:
 
-#### Frame types (server → client)
+```jsonc
+// progress — per stage, per diagram type
+{ "type": "progress", "diagram_type": "sequence", "stage": "generating_ir", "percent": 40 }
+// stages: selecting_diagrams(10) -> generating_ir(40) -> validating_ir(60)
+//         -> generating_plantuml(75) -> rendering_svg(90)
 
-**`progress`** — emitted at each pipeline stage for each diagram type
-```json
-{
-  "type": "progress",
-  "diagram_type": "sequence",
-  "stage": "generating_ir",
-  "message": "Generating IR..."
-}
-```
-Stages in order: `selecting_diagrams` → `generating_ir` → `validating` → `generating_code` → `validating_plantuml` → `rendering`
+// diagram_result — one per finished diagram (success, carried-forward, or shown-invalid)
+{ "type": "diagram_result", "diagram_id": "uuid", "diagram_type": "sequence",
+  "plantuml_code": "@startuml...", "svg": "<svg...>", "ir": { },
+  "is_fallback": false, "validation": { "is_valid": true, "errors": [], "warnings": [] } }
 
----
+// complete — once the run finishes
+{ "type": "complete", "diagrams_generated": 3, "total_time_ms": 8421 }
 
-**`diagram_result`** — emitted when one diagram finishes (success or fallback)
-```json
-{
-  "type": "diagram_result",
-  "diagram_type": "sequence",
-  "diagram_id": "uuid-...",
-  "svg": "<svg...></svg>",
-  "plantuml_code": "@startuml...",
-  "status": "complete"
-}
-```
-Diagrams arrive independently — frontend renders each as it arrives, not after all are done.
-
----
-
-**`complete`** — emitted once all diagrams finish
-```json
-{
-  "type": "complete",
-  "message_id": "uuid-...",
-  "total_diagrams": 3,
-  "successful": 3
-}
-```
-Safe to close the WS after this frame.
-
----
-
-**`error`** — per-diagram error, pipeline continues for other types
-```json
-{
-  "type": "error",
-  "diagram_type": "class",
-  "message": "Repair failed after 3 retries"
-}
+// error — a diagram failed with no salvageable code
+{ "type": "error", "diagram_type": "class", "error_code": "GENERATION_FAILED",
+  "message": "...", "partial_code": null }
 ```
 
-**ConnectionManager** (`core/ws_manager.py`): maintains a dict of `message_id → List[WebSocket]`. Multiple clients can watch the same generation. When the orchestrator calls `manager.broadcast(message_id, frame)`, all connected sockets receive it. Disconnected sockets are silently removed.
+`ConnectionManager` maps `message_id → List[WebSocket]`; multiple clients can watch one generation; the per-message buffer is dropped after `complete`.
 
 ---
 
 ## 5. Generation Pipeline
 
-Triggered via FastAPI `BackgroundTasks` immediately after message creation. HTTP response returns 202 before the pipeline starts.
-
-```
-POST /messages
-    │
-    ├── return 202 immediately (message_id in body)
-    │
-    └── BackgroundTasks.add_task(run_orchestrator, message_id)
-            │
-            ▼
-        asyncio.gather(
-            generate_one("sequence"),
-            generate_one("component"),
-            generate_one("class"),
-        )
-        # All diagram types run in parallel
-        # Total latency ≈ slowest single diagram, not the sum
-```
+Triggered via `BackgroundTasks` after the 202. `run_orchestrator_background` builds specs (create path: auto-select → all `generate`) or receives a prebuilt action plan (update path). Each spec runs through `process_single_diagram` under a `Semaphore(4)`.
 
 ### Per-diagram steps
 
 ```
-Step 1: Prompt Processing
-    New message  → pass through
-    Updated msg  → process_prompt(new, old) → bundled context string
+carry_forward  → copy the prior diagram row (ir + plantuml) to the new turn,
+                 re-render SVG, broadcast. No LLM.
 
-Step 2: Diagram Selection
-    User specified types  → validate against 14 known UML types
-    No types specified    → ask LLM to recommend based on the prompt
-
-Step 3: IR Generation (Groq LLM)  ← only LLM call in the happy path
-    Input:  system_prompt.txt + JSON schema + few-shot examples + user prompt
-    Output: structured JSON matching the IR schema for that diagram type
-    Model:  llama-3.3-70b-versatile via Groq API (~700 tok/s)
-
-Step 4: Validation + Repair Loop
-    validate_ir() → Pydantic schema check on the LLM JSON output
-    On failure → repair_agent() re-prompts with broken IR + error messages
-    Up to 3 retries. If all fail → mark diagram "error", continue for others.
-
-Step 5: Code Generation (deterministic, no LLM)
-    ir_to_plantuml() converts validated IR dict → PlantUML DSL string
-    Sequence: participants → messages → alt/loop fragments
-    Class:    entities → attributes → methods → relationships
-    Component: components → interfaces → dependencies
-    Other types (activity, usecase, state): fallback to direct LLM DSL generation
-
-Step 6: PlantUML Validation
-    Structural check: starts with @startuml, ends with @enduml, ≥3 lines
-    (Known gap: full JAR -syntax validation not implemented)
-
-Step 7: SVG Rendering
-    Encode DSL with PlantUML's custom base64 encoding
-    HTTP GET → plantuml-server:8090/svg/{encoded}
-    Store SVG in DB
-    Broadcast diagram_result frame over WS
-    On failure: store fallback SVG, broadcast error frame
+generate / regenerate:
+  1. Cache check (fresh generate only)
+  2. IR generation (Groq, JSON mode)          [full-IR types]
+       or direct PlantUML                       [best-effort types]
+       - prior_ir given (regenerate) -> edit the existing IR
+       - LLMConfigError -> loud CONFIG_ERROR frame (not a stub)
+  3. Validate IR (Pydantic) + repair loop (≤3)  [IR types]
+  4. IR -> PlantUML DSL (deterministic)
+  5. Structural DSL check
+  6. Render -> SVG; DETECT PlantUML error image
+       - error + IR type + retries left -> repair and re-render
+  7. Success -> cache (source of truth) + upsert Diagram + broadcast diagram_result
+       Failure -> see below
 ```
 
-**Why `BackgroundTasks` instead of returning the result synchronously?**
-The pipeline takes 10–30s. Holding the HTTP connection open for that long means the client can't do anything else, connection timeouts are a risk, and the frontend can't show incremental progress. `BackgroundTasks` returns control to the client immediately, and WS handles the async result delivery.
+**On failure** (`_handle_failure`): if this was a *regeneration* and a prior good diagram exists → **carry the prior forward** (no-stub-overwrite). Otherwise persist + broadcast the model's **real attempted PlantUML** as `is_valid=false, is_fallback=true` (the UI shows the code + an error banner). Only if there's nothing salvageable is a bare `error` frame sent. No fabricated example diagram, ever.
+
+Writes are **upserts** keyed on `(message_id, diagram_type)` (the unique constraint), so retries/re-dispatch never duplicate rows.
 
 ---
 
-## 6. IR Abstraction Layer
+## 6. Update Semantics (diff + carry-forward)
 
-The Intermediate Representation (IR) is the architectural boundary between "what the LLM outputs" and "what gets rendered."
+The behavior a reviewer will poke at: "if I ask to add a component, do the other diagrams get destroyed?" No.
 
-### Example: Sequence IR
+```
+requested types        = what the update selected  (e.g. [sequence, class, component])
+prev_good_types        = types with a valid, non-fallback diagram on the previous turn
+targeted               = classify_update_targets(update_text, prev_good_types)   # small LLM call
+
+for each requested type t:
+    t not in prev_good_types      -> generate       (brand-new type)
+    t in targeted                 -> regenerate      (edit prior IR)
+    otherwise                     -> carry_forward   (copy prior, no LLM)
+prev types not requested          -> dropped
+```
+
+- "**also add a component**" → `component` generates; `sequence`, `class` carried forward byte-identical.
+- "**make the sequence async**" → classifier targets `sequence` → only it regenerates (from prior IR); others carried forward.
+- Classification failure defaults to "targets nothing" (safe: carry everything forward rather than risk a destructive regen).
+
+The classifier runs in the **background** (an LLM call), not in the request handler, so the `PUT` still returns 202 fast.
+
+---
+
+## 7. IR Abstraction Layer
+
+The IR is the boundary between "what the LLM understands" and "what renders."
+
+- **7 full-IR types** (`IR_SCHEMA_MAP`): `sequence`, `class`, `component`, `activity`, `usecase`, `state`, `deployment`. Each has a Pydantic model with a `@model_validator` enforcing referential integrity (every edge/message/relationship endpoint must resolve to a declared node), a deterministic generator in `code_generator.py`, and a few-shot example in `prompts/few_shot_examples/`.
+- **7 best-effort types**: `object`, `package`, `composite_structure`, `communication`, `interaction_overview`, `timing`, `profile`. The LLM emits PlantUML directly (guided by a per-type snippet); output is sanitized to a clean `@startuml…@enduml` block. No structured validation/repair — flagged β in the UI.
+
+Example — sequence IR:
 
 ```json
 {
-  "title": "SEBI Circular Ingestion",
-  "participants": [
-    { "name": "User",    "type": "actor" },
-    { "name": "API",     "type": "participant" },
-    { "name": "Parser",  "type": "participant" },
-    { "name": "DB",      "type": "database" }
-  ],
-  "messages": [
-    { "from": "User",   "to": "API",    "label": "GET /circulars", "type": "sync" },
-    { "from": "API",    "to": "Parser", "label": "parse(raw)",     "type": "async" },
-    { "from": "Parser", "to": "DB",     "label": "insert(clause)", "type": "sync" }
-  ]
+  "diagram_type": "sequence", "title": "SEBI Circular Ingestion",
+  "participants": [ { "id": "u", "label": "User", "type": "actor" },
+                    { "id": "api", "label": "API", "type": "participant" } ],
+  "messages": [ { "from": "u", "to": "api", "label": "GET /circulars", "type": "sync", "order": 1 } ],
+  "fragments": []
 }
 ```
 
-### Why IR instead of raw DSL output?
-
-| Concern | Direct DSL | Via IR |
-|---|---|---|
-| Validation | Regex heuristics or JVM overhead | Pydantic schema — precise, fast |
-| Error messages for repair | "Syntax error near line 7" | "Participant 'Scraper' used in message but not declared" |
-| ART training signal | String diff of DSL | Structured JSON diff of IR — clean DPO (chosen/rejected) pairs |
-| Adding a new diagram type | Prompt engineering for valid DSL | Add IR schema + code generator — orchestrator unchanged |
-
-### IR schemas (`app/prompts/`)
-
-- `ir_schema_sequence.json` — sequence diagram IR
-- `ir_schema_class.json` — class diagram IR
-- `ir_schema_component.json` — component diagram IR
-- `schemas/ir.py` — Pydantic models: `SequenceDiagramIR`, `ClassDiagramIR`, `ComponentDiagramIR`
+Why IR over raw DSL: Pydantic validation is precise and fast; repair errors are semantic ("participant 'X' used but not declared"); adding a type = schema + generator, orchestrator unchanged; and the IR is the right unit for training signal.
 
 ---
 
-## 7. Caching Strategy
+## 8. Data Layer
 
-**In-memory SHA-256 cache** (`services/cache.py`)
+The schema is designed so common queries are a **single join**, and stored data is the source of truth only.
 
-Cache key = `SHA-256(prompt + diagram_type)`
+### Tables
 
-Before calling Groq, the orchestrator checks the cache. A cache hit skips the entire LLM call + validation + code gen + render sequence.
+- **User** → **Session** (`user_id`) → **Message** (`session_id`) → **Diagram** (`message_id`).
+- **Message**: one user turn. `version` + `parent_msg_id` model lineage (the chain is walked for context and carry-forward); `status` (processing/complete/failed) makes a crashed generation visible; `diagram_types` is *requested* metadata only (the produced set is the Diagram rows). No `role` column (all turns are user turns; the assistant output is diagrams).
+- **Diagram**: `ir` + `plantuml_code` (**no `svg`** — re-rendered on demand), truthful `is_valid` / `is_fallback`, provenance `model` + `prompt_version`, `version`. `UniqueConstraint(message_id, diagram_type)` → upserts, no duplicates.
+- **Feedback**: **always anchored to `message_id`** (single join path); `diagram_id` is an optional *refinement*, not a second parent. Both `Message.feedbacks` and `Diagram.feedbacks` relationships exist. Cascades on delete.
+- **TrainingSample**: durable ART/DPO samples with the real `user_id`, `scope`, and generation provenance (replaces logging to stdout).
 
-```python
-cache_key = sha256(f"{prompt}:{diagram_type}".encode()).hexdigest()
-if cache_key in CACHE:
-    return CACHE[cache_key]   # full result, no LLM call
-# ... run pipeline ...
-CACHE[cache_key] = result
-```
+### Versioning / storage model — *snapshot + render-on-open*
 
-**Trade-offs:**
-- Cache is lost on process restart
-- Not shared across instances (single-instance design)
-- For production: Redis with TTL, keyed the same way
+Each turn owns a **full set** of Diagram rows; carried-forward diagrams are copied. Only `ir` + `plantuml_code` are stored; SVG is re-rendered from PlantUML when needed (live over WS, and on session re-open via `GET .../diagrams`). Trade-off consciously accepted: `ir`/`plantuml_code` are duplicated across versions in exchange for immutable per-version snapshots and dead-simple `WHERE message_id` queries.
 
-**Other latency optimizations:**
-- `asyncio.gather` — all diagram types in parallel; latency = slowest single diagram
-- Groq inference — ~700 tok/s vs ~60 tok/s on GPU inference
-- Async throughout — `aiosqlite`, `httpx` async, no blocking I/O
-- Early streaming — WS pushes each diagram result as it completes; user sees diagram 1 while 2 and 3 are still generating
+### Integrity
+
+`PRAGMA foreign_keys=ON` (SQLite ignores FKs otherwise) + `ondelete="CASCADE"`; WAL + `busy_timeout` for the parallel fan-out writes; composite indexes matching the actual sort paths (`messages(session_id, created_at)`, `sessions(user_id, updated_at)`); timezone-aware UTC timestamps. Schema evolution is via **Alembic** (initial migration checked in).
 
 ---
 
-## 8. Feedback & ART Loop
+## 9. Memory & Conversation Context
 
-**Design intent: Direct Preference Optimization (DPO)**
+`build_context(prompts)` assembles the **full** conversation from the ordered `parent_msg_id` lineage — original requirements + each update + the current instruction — so context never collapses to a single turn (the earlier one-level bundle dropped the original prompt after two updates). On the client, `ChatPanel` restores `lastMessageId` from loaded history so a follow-up after a page reload is correctly treated as an **update**, and `DiagramPanel` re-hydrates prior diagrams from the DB. Regeneration additionally passes the previous diagram's `ir` to the planner (edit mode) for consistent refinements.
 
-When feedback arrives, the system constructs a DPO training sample:
+---
+
+## 10. Caching Strategy
+
+Bounded in-memory **LRU** (`services/cache.py`), keyed `sha256(prompt_context + ":" + diagram_type)`, storing `{ir, plantuml_code}` (not SVG). A cache hit skips the LLM + validation + code-gen. **Fallbacks are never cached** — otherwise a transient outage would be served forever. Documented single-process trade-off (Redis for multi-instance).
+
+Other latency levers: `asyncio.gather` (parallel per type; wall-clock ≈ slowest), `Semaphore(4)` to avoid Groq rate-limit bursts, Groq's fast inference, async I/O throughout, and early WS streaming (each diagram shown as it finishes).
+
+---
+
+## 11. Feedback & Training Data
+
+Feedback is stored and turned into a **correct, attributable** training sample (`TrainingSample` table):
 
 ```json
 {
-  "prompt": "<original user prompt>",
-  "chosen":   { "ir": { /* high-rated IR, rating ≥ 4 */ }, "rating": 5 },
-  "rejected": { "ir": { /* low-rated IR,  rating ≤ 2 */ }, "rating": 2 }
+  "user_id": "<real user id>",
+  "input": { "prompt": "<message prompt>", "diagram_types": ["sequence","class"] },
+  "diagram": { "diagram_type": "sequence", "ir": { }, "model": "llama-3.3-70b-versatile", "prompt_version": "2026-07-14" },
+  "signal": "chosen",         // rating >= 4 -> chosen, < 3 -> rejected, else neutral
+  "feedback": { "type": "praise", "rating": 5, "text": "great", "corrections": null },
+  "timestamp": "2026-07-14T..."
 }
 ```
 
-These (prompt, chosen, rejected) triples are the training signal for DPO — the model learns to increase the likelihood of generating IRs that look like `chosen` over `rejected` for the same prompt. LangChain's ART (Automated Reward Training) plugin would consume these samples to continuously fine-tune the Llama model's IR generation quality.
-
-**Current state:** The logging stub in `feedback_service.py` is wired and formats the sample correctly. The actual ART training loop is not instantiated — it logs to stdout as a placeholder. In production it would push to a training queue (S3 bucket or message broker) that the ART trainer polls.
+This fixes an earlier bug where the "user" field was `sha256(diagram_id)` (the diagram id mislabeled as the user) and samples were only logged. The intent is DPO: (prompt, chosen IR, rejected IR) triples that a trainer increases/decreases likelihood on. **Deferred:** wiring these back into generation (a live trainer) is out of scope for this build — the data is collected correctly, not yet consumed.
 
 ---
 
-## 9. Probable Interview Questions
+## 12. Interview Q&A
 
-### System Design
+### Using the AI tool — and challenging its decisions
 
-**Q: Why WebSocket instead of HTTP polling or Server-Sent Events?**
+**Q: You built this with an agentic coding tool. How did you use it, and how do you know it's not just "something that works"?**
 
-Pipeline latency is 10–30s and produces multiple independent outputs (one per diagram type). Polling at 2s creates unnecessary server load and still feels laggy. SSE is unidirectional — fine for this use case, but WS is more natural for a chat interface where the client might need to send signals (e.g., cancellation). WS also lets the `ConnectionManager` support multiple concurrent watchers on the same `message_id` with no extra work.
+Claude Code was the primary implementer; my job was to interrogate its granular decisions, not just accept passing behavior. A first pass "worked" but I found and fixed a series of decisions a careful engineer should challenge:
 
----
+- **Feedback schema (the one you flagged):** it modeled feedback with two nullable parents (`diagram_id` OR `message_id`) — a polymorphic-parent anti-pattern forcing UNION queries. Reworked so feedback is always anchored to `message_id` with `diagram_id` as a refinement → one join path.
+- **"Syntax verification" was a facade:** the renderer treated any HTTP 200 as success, but PlantUML returns 200 with an *error image*. Now the renderer detects error responses and routes them into the repair loop.
+- **Silent example fallbacks:** on any LLM hiccup it rendered a few-shot *example* as if it were the user's diagram. Now failures surface the model's real attempted code (flagged) or a clear error — never a fake.
+- **Mislabeled training data:** the "user_hash" in the ART sample was `sha256(diagram_id)` — the diagram id, not the user. Fixed to the real `user_id` + generation provenance, persisted durably.
+- **Update destroyed good diagrams:** an update re-ran every selected type from scratch; a single transient failure replaced a good diagram with a stub. Now updates diff + carry forward, and a failed regen keeps the prior good one.
+- Plus: unbounded in-memory cache (bounded + never caches fallbacks), a blocking LLM call on the event loop (offloaded), storing SVG in the DB (dropped for render-on-open), a dead `role` column and double lineage (removed), duplicated fragile model-fallback code (centralized in `llm_client`).
 
-**Q: Why an IR layer instead of asking the LLM to output PlantUML directly?**
+### System design
 
-LLMs frequently produce subtly invalid DSL — mismatched lifeline names, undefined participants in fragments, incorrect arrow syntax. Validating raw PlantUML requires running the JAR (JVM overhead) or regex heuristics that miss edge cases. The IR layer gives us a schema-validated JSON structure that we can validate with Pydantic in milliseconds, repair semantically ("participant X used but not declared" is a clear error message), and convert deterministically to DSL. It also decouples the LLM concern (understanding intent) from the rendering concern (correct syntax), making each independently improvable. The IR is also the correct unit for ART training — the model learns to produce better IR, not better DSL.
+**Q: Why WebSocket over polling/SSE?** The pipeline is ~10s and produces multiple independent outputs; WS pushes each diagram as it finishes. WS also lets multiple clients watch one `message_id` and supports client→server signals. Early frames survive the connect race via a per-message buffer.
 
----
+**Q: Why an IR layer?** LLMs produce subtly invalid DSL. Schema-validated JSON IR lets us validate in ms with Pydantic, repair with semantic error messages, and generate DSL deterministically — decoupling "intent" from "syntax," and giving a clean training unit. Applied to the 7 core types; the other 7 are honest best-effort direct-PlantUML.
 
-**Q: How do you handle diagram updates without losing history?**
+**Q: How are updates handled without losing history or clobbering diagrams?** New `Message` per turn (`version+1`, `parent_msg_id`). An update computes a per-type action plan (generate / regenerate / carry_forward) using a diff plus an LLM intent classifier; unchanged diagrams are carried forward; a failed regeneration keeps the prior good diagram. The DB is append-only per turn.
 
-Updated prompts create a new `Message` row with `version = previous.version + 1` and `parent_msg_id` pointing to the original. The original message and its diagrams are never modified. `process_prompt()` bundles the full previous context so the LLM has history without the frontend needing to manage message chaining. The DB is append-only — full audit trail of all generation attempts.
+**Q: How is UML rendered and how do you control syntax errors?** DSL is base64-encoded (PlantUML's scheme) and GET to the Docker server → SVG. Most errors are prevented by deterministic gen from validated IR; the repair loop handles the rest; and the renderer now catches PlantUML *error images* (real syntax verification) and re-repairs. SVG is rendered on demand, not stored, and displayed via a `data:` URI `<img>` (no `dangerouslySetInnerHTML`).
 
----
+**Q: How do you minimize latency?** Parallel `asyncio.gather` (wall-clock ≈ slowest diagram), a bounded cache for identical prompts, Groq's fast inference, async I/O throughout, early WS streaming, and carry-forward (unchanged diagrams skip the LLM entirely on updates).
 
-**Q: How is UML rendered? How do you control syntax errors?**
+### Spin-up & correctness
 
-Rendering: PlantUML DSL is encoded using PlantUML's custom base64 encoding and sent as a URL path parameter to the Docker-hosted PlantUML server. The server returns SVG, which is stored in the DB and injected into the DOM.
+**Q: Why 202 on POST /messages?** The message row is created synchronously (you get a `message_id` + `ws_url`), but generation runs in `BackgroundTasks`. 202 = "accepted, not complete" — open the WS for results.
 
-Syntax control: The IR layer prevents most errors — since DSL is generated deterministically from validated IR, structural issues are caught at the IR validation step. The 3-retry repair loop handles the rest. DSL errors that slip through surface as a rendering failure from the PlantUML server, which triggers an `error` WS frame and a fallback SVG. Full JAR-based syntax validation (`plantuml.jar -syntax`) is a known gap — it would let us route DSL errors into the repair loop before the render step.
+**Q: What happens if the API key is missing/invalid?** `llm_client` raises `LLMConfigError`; the orchestrator emits a `CONFIG_ERROR` frame instead of a fake diagram. Transient 503s fall back across `LLM_FALLBACK_MODELS`.
 
----
-
-### API Spin-up
-
-**Q: Walk me through spinning up the APIs properly, end to end.**
-
-1. **Docker first:** `docker-compose up -d` starts the PlantUML server on port 8090. The backend won't crash without it but render calls fail — start it first.
-
-2. **Config validation:** `core/config.py` uses `pydantic-settings`. On import it reads `backend/.env` and validates all required keys. Missing keys throw `ValidationError` before Uvicorn binds a port — you know immediately if config is broken.
-
-3. **DB init on lifespan startup:** FastAPI's `@asynccontextmanager` lifespan calls `init_db()` which runs `Base.metadata.create_all()` via aiosqlite. All five tables created idempotently. No route is callable before the DB is ready. This is the modern replacement for the deprecated `@app.on_event("startup")`.
-
-4. **CORS before routers:** CORS middleware is added before router includes — FastAPI applies middleware in registration order. WS router is at root level because browser WebSocket API doesn't support custom headers on upgrade; auth is `?token=` query param.
-
-5. **`uvicorn app.main:app --reload --port 8000`** — Swagger at `/docs`.
-
-6. **Frontend:** `npm run dev` in `frontend/`. Vite on port 5173 calls the backend directly at `localhost:8000`.
-
----
-
-**Q: Why does POST /messages return 202 instead of 200?**
-
-202 Accepted means "request has been accepted for processing but processing is not complete." The message row is created synchronously (so you get a `message_id`), but the generation pipeline runs via `BackgroundTasks` — it hasn't started yet when the HTTP response is sent. Using 200 would imply the work is done. 202 signals to the client: open your WebSocket connection now, results will stream. This is standard for async job submission APIs.
-
----
-
-**Q: How does authentication work on WebSocket connections?**
-
-The browser's native `WebSocket` API doesn't support custom headers on the upgrade request, so the standard `Authorization: Bearer` pattern doesn't work for WS. The solution is to pass the JWT as a query param: `ws://localhost:8000/ws/stream/{message_id}?token={jwt}`. The WS endpoint reads `token` from `query_params` and calls the same `decode_jwt()` function used by REST routes. Trade-off: the token appears in server logs. In production you'd use a short-lived WS-specific token issued immediately before the connection opens.
-
----
-
-**Q: Why is the FastAPI lifespan pattern used?**
-
-The `@asynccontextmanager` lifespan replaces the deprecated `@app.on_event("startup")` / `@app.on_event("shutdown")` decorators (deprecated in FastAPI 0.93+). Lifespan is more composable — it uses a standard Python context manager, easier to test by injecting a mock lifespan, and the startup/shutdown code is co-located in one function. If `init_db()` raises, the process exits before accepting requests. The old event-based approach made it possible for the app to start accepting requests before startup events completed in some edge cases.
-
----
+**Q: How does an old session show its diagrams again?** `ChatPanel` restores `lastMessageId` and `DiagramPanel` calls `GET .../diagrams`, which re-renders SVG from stored `plantuml_code` (no LLM, sub-second). No regeneration.
 
 ### Scalability
 
-**Q: What breaks first at scale? How would you fix it?**
-
 | Bottleneck | Fix |
 |---|---|
-| In-memory cache (lost on restart, not shared) | Redis with TTL, same SHA-256 key |
-| `BackgroundTasks` (runs in web server process) | Celery / ARQ task queue with Redis broker |
-| WS `ConnectionManager` (in-memory dict, not shared) | Redis pub/sub — orchestrator publishes to per-`message_id` channel |
-| SQLite (single writer) | PostgreSQL + asyncpg |
-| Groq rate limits (unbounded LLM calls) | Semaphore or token bucket rate limiter on planner |
+| In-memory cache / WS manager (per-process) | Redis (cache with TTL; pub/sub for WS fan-out) |
+| `BackgroundTasks` in the web process | Celery / ARQ + broker |
+| SQLite single writer | PostgreSQL + asyncpg (Alembic already in place) |
+| Groq rate limits | `Semaphore(4)` today; token-bucket limiter for scale |
 
----
+### Known gaps to close before production
 
-**Q: How do you minimize latency?**
-
-- `asyncio.gather` — all diagram types run in parallel; 3 diagrams ≈ latency of the slowest one
-- SHA-256 cache — identical prompts skip the entire pipeline
-- Groq — ~700 tok/s inference vs ~60 tok/s on GPU-based providers
-- Async throughout — no blocking I/O anywhere in the stack
-- Early streaming — each diagram is pushed to the browser as it completes, not after all finish
-
----
-
-### Implementation
-
-**Q: How does the ART / RL feedback loop work?**
-
-The design targets DPO (Direct Preference Optimization). Feedback submissions are structured as (prompt, chosen IR, rejected IR) triples where "chosen" comes from high-rated generations (≥4 stars) and "rejected" from low-rated ones (≤2 stars). The model learns to increase the likelihood of generating IRs that look like "chosen" over "rejected" for the same prompt. LangChain's ART plugin would consume these samples to fine-tune the base model. Current implementation: the sample is formatted and logged — the actual training queue is a stub.
-
----
-
-**Q: You used an agentic coding tool for this round — how did you use it and how did you verify the output?**
-
-I used Claude Code as the primary development agent. The workflow was: decompose the spec into phases (auth → session model → orchestrator → WS → frontend), prompt the agent with each phase with explicit acceptance criteria, then review every generated file before proceeding. Verification involved reading generated services end-to-end, checking correctness of async patterns (`asyncio.gather`, `BackgroundTasks`), and tracing the WebSocket message flow manually. I identified several bugs the agent introduced — SHA-256 instead of bcrypt for password hashing, unsanitized SVG injection, inverted ART training logic — demonstrating I understand the codebase, not just that I generated it.
-
----
-
-**Q: What are the known gaps you'd fix before production?**
-
-1. **Bcrypt:** Switch `security.py` from `hashlib.sha256` to `passlib.CryptContext` with bcrypt — SHA-256 with no salt is vulnerable to rainbow table attacks
-2. **SVG sanitization:** Run SVG through DOMPurify before `dangerouslySetInnerHTML` injection to prevent XSS
-3. **Diagram history:** Call `GET /diagrams?message_id=` on session load so previously generated diagrams are visible without regenerating — currently only live WS output persists in the UI
-4. **Full PlantUML validation:** Run `java -jar plantuml.jar -syntax` to catch DSL errors before the render step, routing them into the repair loop
-5. **Task queue:** Move `BackgroundTasks` to Celery/ARQ for production resilience
-6. **Redis:** Replace in-memory cache and WS `ConnectionManager` with Redis-backed equivalents for multi-instance support
+1. **Security (all deferred):** bcrypt/argon2 passwords, authenticate the WS endpoint, fix the `get_diagram_file` IDOR + feedback ownership checks, rate limiting, JWT refresh/revocation, stop committing `.env`/DB and rotate secrets.
+2. **Feedback loop:** consume `TrainingSample` in a real DPO/RL trainer and feed learned corrections back into generation.
+3. **Best-effort types:** promote high-value ones (timing, object, package) to full IR.
+4. **Multi-instance:** Redis-backed cache + WS, Postgres, a task queue.

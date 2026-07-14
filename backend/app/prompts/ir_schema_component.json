@@ -1,0 +1,49 @@
+{
+  "type": "object",
+  "title": "ComponentDiagramIR",
+  "required": ["diagram_type", "title", "components"],
+  "properties": {
+    "diagram_type": { "type": "string", "const": "component" },
+    "title": { "type": "string" },
+    "components": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id":         { "type": "string" },
+          "name":       { "type": "string" },
+          "stereotype": { "type": "string", "description": "e.g. service, database, ui, gateway, cache" }
+        }
+      }
+    },
+    "interfaces": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "provided_by", "required_by"],
+        "properties": {
+          "id":          { "type": "string" },
+          "name":        { "type": "string" },
+          "provided_by": { "type": "string", "description": "Component id that exposes this interface" },
+          "required_by": { "type": "array", "items": { "type": "string" }, "description": "Component ids that consume this interface" }
+        }
+      }
+    },
+    "dependencies": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["from", "to"],
+        "properties": {
+          "from":  { "type": "string", "description": "Dependent component id" },
+          "to":    { "type": "string", "description": "Provider component id" },
+          "label": { "type": "string" }
+        }
+      }
+    }
+  }
+}

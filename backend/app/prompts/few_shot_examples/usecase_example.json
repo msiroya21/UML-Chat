@@ -1,0 +1,22 @@
+{
+  "prompt": "A compliance monitoring platform is used by a compliance officer to review regulatory gaps and generate audit reports. The system also ingests circulars automatically from a regulator feed. Generating a report always includes reviewing gaps first.",
+  "ir": {
+    "diagram_type": "usecase",
+    "title": "Compliance Platform Use Cases",
+    "actors": [
+      { "id": "officer",   "name": "Compliance Officer" },
+      { "id": "regulator", "name": "Regulator Feed" }
+    ],
+    "usecases": [
+      { "id": "ingest", "name": "Ingest Circulars" },
+      { "id": "review", "name": "Review Gaps" },
+      { "id": "report", "name": "Generate Audit Report" }
+    ],
+    "relationships": [
+      { "from": "regulator", "to": "ingest", "type": "association" },
+      { "from": "officer",   "to": "review", "type": "association" },
+      { "from": "officer",   "to": "report", "type": "association" },
+      { "from": "report",    "to": "review", "type": "include" }
+    ]
+  }
+}

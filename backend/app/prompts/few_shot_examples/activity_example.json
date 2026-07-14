@@ -1,0 +1,25 @@
+{
+  "prompt": "A compliance pipeline pulls regulatory circulars, parses them into clauses, then checks whether each clause is already covered by an existing policy. Covered clauses are logged; uncovered clauses raise a gap alert.",
+  "ir": {
+    "diagram_type": "activity",
+    "title": "Circular Ingestion & Gap Check",
+    "nodes": [
+      { "id": "start",  "type": "start",    "label": "" },
+      { "id": "pull",   "type": "action",   "label": "Pull latest circulars" },
+      { "id": "parse",  "type": "action",   "label": "Parse into clauses" },
+      { "id": "check",  "type": "decision", "label": "Clause covered by policy?" },
+      { "id": "log",    "type": "action",   "label": "Log as compliant" },
+      { "id": "alert",  "type": "action",   "label": "Raise gap alert" },
+      { "id": "end",    "type": "end",      "label": "" }
+    ],
+    "edges": [
+      { "from": "start", "to": "pull" },
+      { "from": "pull",  "to": "parse" },
+      { "from": "parse", "to": "check" },
+      { "from": "check", "to": "log",   "guard": "yes" },
+      { "from": "check", "to": "alert", "guard": "no" },
+      { "from": "log",   "to": "end" },
+      { "from": "alert", "to": "end" }
+    ]
+  }
+}

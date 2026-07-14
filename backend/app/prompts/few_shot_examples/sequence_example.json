@@ -1,0 +1,21 @@
+{
+  "prompt": "A web scraper service fetches data from an external API, parses it, and stores results in a database. Users trigger scraping on demand.",
+  "ir": {
+    "diagram_type": "sequence",
+    "title": "Web Scraper Flow",
+    "participants": [
+      { "id": "user",    "label": "User",          "type": "actor" },
+      { "id": "scraper", "label": "Scraper Svc",   "type": "component" },
+      { "id": "api",     "label": "External API",  "type": "component" },
+      { "id": "db",      "label": "Storage DB",    "type": "database" }
+    ],
+    "messages": [
+      { "from": "user",    "to": "scraper", "label": "Trigger scrape",       "type": "sync",   "order": 1 },
+      { "from": "scraper", "to": "api",     "label": "GET /data",            "type": "sync",   "order": 2 },
+      { "from": "api",     "to": "scraper", "label": "200 JSON payload",     "type": "return", "order": 3 },
+      { "from": "scraper", "to": "db",      "label": "INSERT parsed records","type": "sync",   "order": 4 },
+      { "from": "db",      "to": "scraper", "label": "ACK",                  "type": "return", "order": 5 },
+      { "from": "scraper", "to": "user",    "label": "Scrape complete",      "type": "return", "order": 6 }
+    ]
+  }
+}

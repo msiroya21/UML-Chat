@@ -1,0 +1,23 @@
+{
+  "prompt": "A regulatory circular moves through states in the compliance system: once received it is queued for parsing, then parsed, then analysed for gaps. After analysis it is either archived (no gaps) or flagged for remediation. A flagged circular returns to analysed once remediation is done.",
+  "ir": {
+    "diagram_type": "state",
+    "title": "Circular Lifecycle",
+    "states": [
+      { "id": "received",  "name": "Received" },
+      { "id": "parsing",   "name": "Parsing" },
+      { "id": "analysed",  "name": "Analysed" },
+      { "id": "archived",  "name": "Archived" },
+      { "id": "flagged",   "name": "Flagged For Remediation" }
+    ],
+    "transitions": [
+      { "from": "received", "to": "parsing",  "label": "queue" },
+      { "from": "parsing",  "to": "analysed", "label": "parsed" },
+      { "from": "analysed", "to": "archived", "label": "no gaps" },
+      { "from": "analysed", "to": "flagged",  "label": "gaps found" },
+      { "from": "flagged",  "to": "analysed", "label": "remediated" }
+    ],
+    "initial": "received",
+    "finals": ["archived"]
+  }
+}

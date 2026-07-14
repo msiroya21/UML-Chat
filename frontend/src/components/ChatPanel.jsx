@@ -1,7 +1,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { getMessages, submitMessage, updateMessage, submitMessageFeedback } from '../services/api';
 
-const SUPPORTED = new Set(['sequence', 'class', 'component']);
+// Types with a full structured-IR pipeline (validation + auto-repair).
+// The rest are best-effort "direct PlantUML" and shown with a β tag.
+const SUPPORTED = new Set([
+  'sequence', 'class', 'component',
+  'activity', 'usecase', 'state', 'deployment',
+]);
 
 const DIAGRAM_TYPES = [
   'sequence', 'class', 'component',
@@ -10,7 +15,7 @@ const DIAGRAM_TYPES = [
   'communication', 'interaction_overview', 'timing', 'profile',
 ];
 
-export default function ChatPanel({ token, sessionId, onWsPath, onRefreshSessions }) {
+export default function ChatPanel({ token, sessionId, onLive, onHistory, onRefreshSessions }) {
   const [messages, setMessages] = useState([]);
   const [prompt, setPrompt] = useState('');
   const [selectedTypes, setSelectedTypes] = useState(['sequence', 'class']);
@@ -20,11 +25,26 @@ export default function ChatPanel({ token, sessionId, onWsPath, onRefreshSession
   const [feedbackDone, setFeedbackDone] = useState(false);
   const textareaRef = useRef(null);
 
+  // On session open/switch: load messages, restore lastMessageId from history (so the
+  // next prompt is an UPDATE, not a new v1), and re-hydrate that turn's diagrams.
   useEffect(() => {
     if (!sessionId) { setMessages([]); setLastMessageId(null); setMode('generate'); return; }
+    setMode('generate');
     getMessages(token, sessionId)
-      .then(data => setMessages(data.messages || []))
+      .then(data => {
+        const msgs = data.messages || [];
+        setMessages(msgs);
+        if (msgs.length > 0) {
+          const latest = msgs[msgs.length - 1].message_id;
+          setLastMessageId(latest);
+          onHistory && onHistory(sessionId, latest);
+        } else {
+          setLastMessageId(null);
+        }
+      })
       .catch(console.error);
+    // onHistory intentionally omitted from deps to avoid a reload loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, token]);
 
   function handlePromptChange(e) {
@@ -39,6 +59,9 @@ export default function ChatPanel({ token, sessionId, onWsPath, onRefreshSession
       prev.includes(t) ? prev.filter(x => x !== t) : [...prev, t]
     );
   }
+
+  function selectAll() { setSelectedTypes([...DIAGRAM_TYPES]); }
+  function clearAll() { setSelectedTypes([]); }
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -65,23 +88,19 @@ export default function ChatPanel({ token, sessionId, onWsPath, onRefreshSession
 
       const newMsg = {
         message_id: res.message_id,
-        role: 'user',
         prompt: prompt.trim(),
         diagram_types: selectedTypes,
         version: res.version || 1,
       };
       setMessages(prev => [...prev, newMsg]);
       setLastMessageId(res.message_id);
-      onWsPath(res.ws_url);
+      onLive(res.ws_url);
       setPrompt('');
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
-      if (isFirstMessage && onRefreshSessions) {
-        // Refresh once now (shows "New Session"), then again after a few seconds
-        // to pick up the LLM-generated title from the background task
-        onRefreshSessions();
-        setTimeout(onRefreshSessions, 4000);
-      }
+      if (isFirstMessage && onRefreshSessions) onRefreshSessions();
+      // The auto-generated title is picked up when generation completes:
+      // DiagramPanel calls onComplete -> App bumps refreshKey (no fixed timer).
     } catch (err) {
       alert('Error: ' + err.message);
     } finally {
@@ -96,7 +115,7 @@ export default function ChatPanel({ token, sessionId, onWsPath, onRefreshSession
       <div className="message-list">
         {!sessionId && <p className="empty-hint">Select or create a session to start</p>}
         {messages.map(m => (
-          <div key={m.message_id} className={`message message-${m.role}`}>
+          <div key={m.message_id} className="message message-user">
             <div className="message-bubble">
               <p className="message-text">{m.prompt}</p>
               {m.diagram_types?.length > 0 && (
@@ -131,7 +150,13 @@ export default function ChatPanel({ token, sessionId, onWsPath, onRefreshSession
 
         {mode === 'generate' && (
           <>
-            <div className="type-selector-label">Diagram types <span className="type-hint">(empty = auto-select)</span></div>
+            <div className="type-selector-label">
+              Diagram types <span className="type-hint">(empty = auto-select)</span>
+              <span className="type-selector-actions">
+                <button type="button" className="type-action-btn" onClick={selectAll}>Select all</button>
+                <button type="button" className="type-action-btn" onClick={clearAll}>Clear</button>
+              </span>
+            </div>
             <div className="type-selector">
               {DIAGRAM_TYPES.map(t => (
                 <label key={t} className={`type-chip ${selectedTypes.includes(t) ? 'selected' : ''} ${!SUPPORTED.has(t) ? 'beta' : ''}`}>

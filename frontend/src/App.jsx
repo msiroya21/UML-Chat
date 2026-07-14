@@ -60,7 +60,8 @@ function AuthPage({ onAuth }) {
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem('token') || '');
   const [currentSessionId, setCurrentSessionId] = useState(null);
-  const [activeWsPath, setActiveWsPath] = useState(null);
+  // view drives the diagram panel: live generation (WS) or historical (REST re-hydration).
+  const [view, setView] = useState(null); // { mode: 'live', wsPath } | { mode: 'history', sessionId, messageId }
   const [refreshKey, setRefreshKey] = useState(0);
 
   function handleAuth(newToken) { setToken(newToken); }
@@ -70,12 +71,12 @@ export default function App() {
     localStorage.removeItem('user_id');
     setToken('');
     setCurrentSessionId(null);
-    setActiveWsPath(null);
+    setView(null);
   }
 
   function handleSelectSession(sessionId) {
     setCurrentSessionId(sessionId);
-    setActiveWsPath(null);
+    setView(null); // ChatPanel sets a history view once it has loaded the session's messages
   }
 
   if (!token) return <AuthPage onAuth={handleAuth} />;
@@ -93,10 +94,15 @@ export default function App() {
         <ChatPanel
           token={token}
           sessionId={currentSessionId}
-          onWsPath={setActiveWsPath}
+          onLive={(wsPath) => setView({ mode: 'live', wsPath })}
+          onHistory={(sessionId, messageId) => setView({ mode: 'history', sessionId, messageId })}
           onRefreshSessions={() => setRefreshKey(k => k + 1)}
         />
-        <DiagramPanel wsPath={activeWsPath} token={token} />
+        <DiagramPanel
+          view={view}
+          token={token}
+          onComplete={() => setRefreshKey(k => k + 1)}
+        />
       </div>
     </div>
   );

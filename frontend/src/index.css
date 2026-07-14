@@ -153,7 +153,34 @@ body { margin: 0; height: 100vh; overflow: hidden; }
   gap: 8px;
 }
 
-.type-selector-label { font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.type-selector-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.type-selector-actions { display: flex; gap: 4px; }
+
+.type-action-btn {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  padding: 2px 8px;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.1s;
+}
+.type-action-btn:hover { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }
 
 .type-selector { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 
@@ -286,6 +313,9 @@ body { margin: 0; height: 100vh; overflow: hidden; }
 .diagram-actions { display: flex; gap: 4px; }
 
 .svg-container {
+  position: relative;
+  display: flex;
+  flex-direction: column;
   padding: 16px;
   max-height: 600px;
   overflow: auto;
@@ -293,6 +323,78 @@ body { margin: 0; height: 100vh; overflow: hidden; }
 }
 
 .svg-container svg { max-width: 100%; }
+
+/* Sticky footer inside the scroll area — keeps the button pinned bottom-right. */
+.svg-toolbar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 8px;
+  margin-top: auto;
+  pointer-events: none; /* let clicks pass through the empty strip to the diagram */
+}
+
+.fullscreen-btn {
+  pointer-events: auto;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  z-index: 2;
+}
+.fullscreen-btn:hover { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }
+
+/* ── Fullscreen diagram overlay ────────────────────────── */
+.diagram-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.75);
+  display: flex;
+  flex-direction: column;
+}
+
+.diagram-fullscreen-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.diagram-fullscreen-controls { display: flex; align-items: center; gap: 6px; }
+.diagram-fullscreen-controls .btn-ghost { background: var(--bg); }
+.zoom-readout {
+  min-width: 46px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.diagram-fullscreen-body {
+  flex: 1;
+  overflow: auto;
+  padding: 24px;
+  background: #fff;
+}
+
+/* Block image + auto margins: fits fully at 100% (centered, no scroll); when zoomed
+   past fit, max-width/height exceed the viewport so scrollbars appear on demand and
+   the top-left stays reachable (unlike flex centering, which clips on overflow). */
+.diagram-fullscreen-body img {
+  display: block;
+  margin: auto;
+  height: auto;
+}
 
 .plantuml-code {
   margin: 0;

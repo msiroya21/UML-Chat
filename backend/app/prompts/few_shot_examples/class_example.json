@@ -1,0 +1,54 @@
+{
+  "prompt": "A compliance monitoring system that manages regulatory circulars, extracts clauses, and tracks compliance status per organisation.",
+  "ir": {
+    "diagram_type": "class",
+    "title": "Compliance Domain Model",
+    "classes": [
+      {
+        "id": "circular",
+        "name": "SEBICircular",
+        "attributes": [
+          { "name": "circular_id",   "type": "str",  "visibility": "public" },
+          { "name": "publish_date",  "type": "date", "visibility": "public" },
+          { "name": "raw_text",      "type": "str",  "visibility": "private" }
+        ],
+        "methods": [
+          { "name": "parse_clauses", "return_type": "List[Clause]", "visibility": "public" }
+        ]
+      },
+      {
+        "id": "clause",
+        "name": "Clause",
+        "attributes": [
+          { "name": "clause_number",   "type": "str",            "visibility": "public" },
+          { "name": "text",            "type": "str",            "visibility": "public" },
+          { "name": "compliance_type", "type": "ComplianceType", "visibility": "public" }
+        ],
+        "methods": []
+      },
+      {
+        "id": "org",
+        "name": "Organisation",
+        "attributes": [
+          { "name": "org_id",   "type": "str", "visibility": "public" },
+          { "name": "name",     "type": "str", "visibility": "public" }
+        ],
+        "methods": [
+          { "name": "get_gap_report", "return_type": "GapReport", "visibility": "public" }
+        ]
+      }
+    ],
+    "relationships": [
+      {
+        "from": "circular", "to": "clause",
+        "type": "composition", "label": "contains",
+        "multiplicity": { "from": "1", "to": "1..*" }
+      },
+      {
+        "from": "org", "to": "clause",
+        "type": "association", "label": "tracks",
+        "multiplicity": { "from": "0..*", "to": "0..*" }
+      }
+    ]
+  }
+}

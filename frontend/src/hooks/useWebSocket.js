@@ -37,17 +37,25 @@ export default function useWebSocket(wsUrl) {
         }));
       } else if (frame.type === 'diagram_result') {
         setDiagrams(prev => [...prev, frame]);
-        // Clear progress for this type once result arrives
+        // Clear this type's bar and the global "selecting types" bar once real work lands.
         setProgress(prev => {
           const next = { ...prev };
           delete next[frame.diagram_type];
+          delete next.all;
           return next;
         });
       } else if (frame.type === 'complete') {
         setIsComplete(true);
         setIsConnected(false);
+        setProgress({}); // no lingering bars after the run finishes
       } else if (frame.type === 'error') {
         setErrors(prev => [...prev, frame]);
+        setProgress(prev => {
+          const next = { ...prev };
+          delete next[frame.diagram_type];
+          delete next.all;
+          return next;
+        });
       }
     };
 

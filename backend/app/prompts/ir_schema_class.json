@@ -1,0 +1,68 @@
+{
+  "type": "object",
+  "title": "ClassDiagramIR",
+  "required": ["diagram_type", "title", "classes"],
+  "properties": {
+    "diagram_type": { "type": "string", "const": "class" },
+    "title": { "type": "string" },
+    "classes": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id":   { "type": "string" },
+          "name": { "type": "string" },
+          "attributes": {
+            "type": "array",
+            "default": [],
+            "items": {
+              "type": "object",
+              "required": ["name", "type"],
+              "properties": {
+                "name":       { "type": "string" },
+                "type":       { "type": "string" },
+                "visibility": { "type": "string", "enum": ["public", "private", "protected", "package"], "default": "public" }
+              }
+            }
+          },
+          "methods": {
+            "type": "array",
+            "default": [],
+            "items": {
+              "type": "object",
+              "required": ["name", "return_type"],
+              "properties": {
+                "name":        { "type": "string" },
+                "return_type": { "type": "string" },
+                "visibility":  { "type": "string", "enum": ["public", "private", "protected", "package"], "default": "public" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["from", "to", "type"],
+        "properties": {
+          "from":  { "type": "string", "description": "Source class id" },
+          "to":    { "type": "string", "description": "Target class id" },
+          "type":  { "type": "string", "enum": ["composition", "aggregation", "inheritance", "association", "dependency", "realization"] },
+          "label": { "type": "string" },
+          "multiplicity": {
+            "type": "object",
+            "properties": {
+              "from": { "type": "string" },
+              "to":   { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

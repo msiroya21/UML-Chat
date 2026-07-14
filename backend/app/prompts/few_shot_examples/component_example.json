@@ -1,0 +1,30 @@
+{
+  "prompt": "A compliance monitoring platform with a scraper, a parser, a gap analysis engine, and a compliance database.",
+  "ir": {
+    "diagram_type": "component",
+    "title": "Compliance Monitoring System",
+    "components": [
+      { "id": "scraper",    "name": "SEBI Scraper",        "stereotype": "service" },
+      { "id": "parser",     "name": "Circular Parser",     "stereotype": "service" },
+      { "id": "gap_engine", "name": "Gap Analysis Engine", "stereotype": "service" },
+      { "id": "db",         "name": "Compliance DB",       "stereotype": "database" }
+    ],
+    "interfaces": [
+      {
+        "id": "i_fetch",
+        "name": "ICircularFetch",
+        "provided_by": "scraper",
+        "required_by": ["parser"]
+      },
+      {
+        "id": "i_store",
+        "name": "IClauseStore",
+        "provided_by": "db",
+        "required_by": ["parser", "gap_engine"]
+      }
+    ],
+    "dependencies": [
+      { "from": "gap_engine", "to": "parser", "label": "parsed clauses" }
+    ]
+  }
+}
